@@ -1,184 +1,511 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
+# Copyright (c) 2022-2025, The Isaac Lab Project
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
 
-import math
-import torch
 from collections.abc import Sequence
+import torch
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation
+from isaaclab.assets import Articulation, RigidObject
+from isaaclab.controllers import OperationalSpaceController, OperationalSpaceControllerCfg
 from isaaclab.envs import DirectMARLEnv
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import sample_uniform
+from isaaclab.utils.math import (
+    matrix_from_quat,
+    quat_apply_inverse,
+    quat_inv,
+    subtract_frame_transforms,
+    sample_uniform,
+)
 
 from .franka_dl_marl_env_cfg import FrankaDlMarlEnvCfg
 
 
 class FrankaDlMarlEnv(DirectMARLEnv):
+    """Dual-arm Franka collaborative assembly with 4 agents (motion+stiffness per robot)."""
+
     cfg: FrankaDlMarlEnvCfg
 
+    # -----------------------------
+    # Standard DirectMARLEnv hooks
+    # -----------------------------
     def __init__(self, cfg: FrankaDlMarlEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        self._cart_dof_idx, _ = self.robot.find_joints(self.cfg.cart_dof_name)
-        self._pole_dof_idx, _ = self.robot.find_joints(self.cfg.pole_dof_name)
-        self._pendulum_dof_idx, _ = self.robot.find_joints(self.cfg.pendulum_dof_name)
+        # OSC controllers
+        self._setup_osc_controllers()
 
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
+        # Cache indices and precompute constants
+        self._cache_robot_indices()
+        self._prepare_kp_bounds()
+
+        # Visualization
+        if self.cfg.enable_visualization_markers:
+            self._setup_visualization()
+
+        # Buffers / state
+        self._success_hold_buf = torch.zeros(self.scene.num_envs, device=self.device)
+        self._last_actions: dict[str, torch.Tensor] = {}
+
+        # Joint centers (nullspace targets) – only arm joints for OSC
+        self._joint_centers_1 = self.robot1.data.default_joint_pos[:, self.arm_joint_ids_1].clone()
+        self._joint_centers_2 = self.robot2.data.default_joint_pos[:, self.arm_joint_ids_2].clone()
+
+    def _setup_visualization(self):
+        """Set up visualization markers for debugging."""
+        marker_cfg = FRAME_MARKER_CFG.copy()
+        marker_cfg.prim_path = "/Visuals/FrameTransformer"
+        marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
+        self.visualization_markers = VisualizationMarkers(marker_cfg)
 
     def _setup_scene(self):
-        self.robot = Articulation(self.cfg.robot_cfg)
-        # add ground plane
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        # clone and replicate
+        """Spawn two Frankas, ground, assembly object, and goal fixture."""
+        # Clone and replicate environments FIRST
         self.scene.clone_environments(copy_from_source=False)
-        # we need to explicitly filter collisions for CPU simulation
-        if self.device == "cpu":
-            self.scene.filter_collisions(global_prim_paths=[])
-        # add articulation to scene
-        self.scene.articulations["robot"] = self.robot
-        # add lights
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        
+        # Create robots
+        self.robot1 = Articulation(self.cfg.robot1)
+        self.robot2 = Articulation(self.cfg.robot2)
+
+        # Ground
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+
+        # Assembly object (dynamic)
+        self.assembly_object = RigidObject(self.cfg.assembly_object)
+
+        # Goal fixture (kinematic)
+        self.goal_fixture = RigidObject(self.cfg.goal_fixture)
+        
+        # Register assets to scene collections
+        self.scene.articulations["robot1"] = self.robot1
+        self.scene.articulations["robot2"] = self.robot2
+        self.scene.rigid_objects["assembly_object"] = self.assembly_object
+        self.scene.rigid_objects["goal_fixture"] = self.goal_fixture
+
+        # Lighting
+        light_cfg = sim_utils.DomeLightCfg(intensity=2200.0, color=(0.85, 0.85, 0.85))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
-        self.actions = actions
+        """Combine per-robot actions (motion + stiffness) -> 19D OSC commands."""
+        self._last_actions = actions  # for rewards
+
+        # Robot 1
+        a1_m = actions["robot1_motion"]        # (N, 13): [pose7 | wrench6]
+        a1_s = actions["robot1_stiffness"]     # (N, 6):  [Kp6]
+        cmd1 = self._build_osc_command(a1_m, a1_s)  # (N, 19)
+        self._set_osc_command(self.robot1, self.osc_1, self.ee_frame_idx_1, cmd1)
+
+        # Robot 2
+        a2_m = actions["robot2_motion"]
+        a2_s = actions["robot2_stiffness"]
+        cmd2 = self._build_osc_command(a2_m, a2_s)
+        self._set_osc_command(self.robot2, self.osc_2, self.ee_frame_idx_2, cmd2)
 
     def _apply_action(self) -> None:
-        self.robot.set_joint_effort_target(
-            self.actions["cart"] * self.cfg.cart_action_scale, joint_ids=self._cart_dof_idx
+        """Compute torques via OSC and apply to both robots."""
+        self._apply_osc_control(
+            self.robot1, self.osc_1, self.ee_frame_idx_1, self.arm_joint_ids_1, self._joint_centers_1
         )
-        self.robot.set_joint_effort_target(
-            self.actions["pendulum"] * self.cfg.pendulum_action_scale, joint_ids=self._pendulum_dof_idx
+        self._apply_osc_control(
+            self.robot2, self.osc_2, self.ee_frame_idx_2, self.arm_joint_ids_2, self._joint_centers_2
         )
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
-        pole_joint_pos = normalize_angle(self.joint_pos[:, self._pole_dof_idx[0]].unsqueeze(dim=1))
-        pendulum_joint_pos = normalize_angle(self.joint_pos[:, self._pendulum_dof_idx[0]].unsqueeze(dim=1))
-        observations = {
-            "cart": torch.cat(
-                (
-                    self.joint_pos[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-                    self.joint_vel[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-                    pole_joint_pos,
-                    self.joint_vel[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                ),
-                dim=-1,
-            ),
-            "pendulum": torch.cat(
-                (
-                    pole_joint_pos + pendulum_joint_pos,
-                    pendulum_joint_pos,
-                    self.joint_vel[:, self._pendulum_dof_idx[0]].unsqueeze(dim=1),
-                ),
-                dim=-1,
-            ),
+        """Same global observation to all agents."""
+        obs_global = self._build_observation()
+        return {
+            "robot1_motion": obs_global,
+            "robot1_stiffness": obs_global,
+            "robot2_motion": obs_global,
+            "robot2_stiffness": obs_global,
         }
-        return observations
+
+    def _get_states(self) -> torch.Tensor:
+        """Global state for centralized critic (MAPPO). 
+        Concatenate all agent observations for centralized value function."""
+        obs_global = self._build_observation()  # (N, 68)
+        # For MAPPO, we concatenate observations from all agents
+        # Since all agents see the same global state, we can just repeat it
+        # State shape: (N, 4 * 68) = (N, 272)
+        state = obs_global.repeat(1, 4)  # Repeat for 4 agents
+        return state
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
-        total_reward = compute_rewards(
-            self.cfg.rew_scale_alive,
-            self.cfg.rew_scale_terminated,
-            self.cfg.rew_scale_cart_pos,
-            self.cfg.rew_scale_cart_vel,
-            self.cfg.rew_scale_pole_pos,
-            self.cfg.rew_scale_pole_vel,
-            self.cfg.rew_scale_pendulum_pos,
-            self.cfg.rew_scale_pendulum_vel,
-            self.joint_pos[:, self._cart_dof_idx[0]],
-            self.joint_vel[:, self._cart_dof_idx[0]],
-            normalize_angle(self.joint_pos[:, self._pole_dof_idx[0]]),
-            self.joint_vel[:, self._pole_dof_idx[0]],
-            normalize_angle(self.joint_pos[:, self._pendulum_dof_idx[0]]),
-            self.joint_vel[:, self._pendulum_dof_idx[0]],
-            math.prod(self.terminated_dict.values()),
-        )
-        return total_reward
+        """Group rewards per robot with role-specific terms added."""
+        rew1 = self._compute_robot_rewards(robot_id=1)
+        rew2 = self._compute_robot_rewards(robot_id=2)
+
+        # Split/assign per agent
+        return {
+            "robot1_motion": rew1["base"] + rew1["motion_terms"] + rew1["conflict_terms"],
+            "robot1_stiffness": rew1["base"] + rew1["stiffness_terms"],
+            "robot2_motion": rew2["base"] + rew2["motion_terms"] + rew2["conflict_terms"],
+            "robot2_stiffness": rew2["base"] + rew2["stiffness_terms"],
+        }
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
-
+        """Success/timeout/failure conditions per agent."""
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        out_of_bounds = torch.any(torch.abs(self.joint_pos[:, self._cart_dof_idx]) > self.cfg.max_cart_pos, dim=1)
-        out_of_bounds = out_of_bounds | torch.any(torch.abs(self.joint_pos[:, self._pole_dof_idx]) > math.pi / 2, dim=1)
 
-        terminated = {agent: out_of_bounds for agent in self.cfg.possible_agents}
-        time_outs = {agent: time_out for agent in self.cfg.possible_agents}
-        return terminated, time_outs
+        # Success: object near goal for hold time
+        obj_pos = self.assembly_object.data.root_pos_w
+        obj_quat = self.assembly_object.data.root_quat_w
+        goal_pos = self._goal_pos.expand_as(obj_pos)
+        goal_quat = self._goal_quat.expand_as(obj_quat)
+
+        pos_ok = torch.norm(obj_pos - goal_pos, dim=-1) < self.cfg.success_position_threshold
+        # quat alignment proxy: 1 - |dot(q,g)| ~ angle error; keep simple dot>cos(th)
+        quat_dot = torch.sum(obj_quat * goal_quat, dim=-1).abs().clamp(max=1.0)
+        ori_ok = quat_dot > torch.cos(torch.tensor(self.cfg.success_orientation_threshold, device=self.device))
+
+        stable = self._object_stable_mask()
+        success_mask = pos_ok & ori_ok & stable
+
+        # hold timer
+        dt = self.step_dt * self.cfg.decimation
+        self._success_hold_buf = torch.where(success_mask, self._success_hold_buf + dt, torch.zeros_like(self._success_hold_buf))
+        success = self._success_hold_buf >= self.cfg.success_hold_time_s
+
+        # Failure: drop or safety
+        dropped = obj_pos[:, 2] < self.cfg.object_drop_height
+        unsafe = self._safety_limit_exceeded()
+
+        terminated = {
+            "robot1_motion": success | dropped | unsafe,
+            "robot1_stiffness": success | dropped | unsafe,
+            "robot2_motion": success | dropped | unsafe,
+            "robot2_stiffness": success | dropped | unsafe,
+        }
+        timeouts = {
+            "robot1_motion": time_out,
+            "robot1_stiffness": time_out,
+            "robot2_motion": time_out,
+            "robot2_stiffness": time_out,
+        }
+        return terminated, timeouts
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
-            env_ids = self.robot._ALL_INDICES
+            env_ids = self.robot1._ALL_INDICES
         super()._reset_idx(env_ids)
 
-        joint_pos = self.robot.data.default_joint_pos[env_ids]
-        joint_pos[:, self._pole_dof_idx] += sample_uniform(
-            self.cfg.initial_pole_angle_range[0] * math.pi,
-            self.cfg.initial_pole_angle_range[1] * math.pi,
-            joint_pos[:, self._pole_dof_idx].shape,
-            joint_pos.device,
+        # Reset robots to defaults (per env origin)
+        for robot in (self.robot1, self.robot2):
+            joint_pos = robot.data.default_joint_pos[env_ids]
+            joint_vel = robot.data.default_joint_vel[env_ids]
+            robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+            default_root_state = robot.data.default_root_state[env_ids]
+            default_root_state[:, :3] += self.scene.env_origins[env_ids]
+            robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+            robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+
+        # Reset object: place on table between robots with random XY & yaw
+        h = self.cfg.assembly_object.tabletop_height
+        pos_xy = sample_uniform(
+            lower=torch.tensor([-0.10, -0.15], device=self.device),
+            upper=torch.tensor([0.10, 0.15], device=self.device),
+            size=(len(env_ids), 2),
+            device=self.device
         )
-        joint_pos[:, self._pendulum_dof_idx] += sample_uniform(
-            self.cfg.initial_pendulum_angle_range[0] * math.pi,
-            self.cfg.initial_pendulum_angle_range[1] * math.pi,
-            joint_pos[:, self._pendulum_dof_idx].shape,
-            joint_pos.device,
+        yaw = sample_uniform(
+            lower=torch.tensor([-0.25], device=self.device),
+            upper=torch.tensor([0.25], device=self.device),
+            size=(len(env_ids), 1),
+            device=self.device
         )
-        joint_vel = self.robot.data.default_joint_vel[env_ids]
+        # yaw -> quat (w,x,y,z) assuming Z-rotation only
+        half = 0.5 * yaw
+        qz = torch.sin(half)
+        qw = torch.cos(half)
+        obj_pos = torch.zeros((len(env_ids), 3), device=self.device)
+        obj_pos[:, 0:2] = pos_xy
+        obj_pos[:, 2] = h + 0.5 * self.cfg.assembly_object.size_xyz[2]
+        obj_quat = torch.zeros((len(env_ids), 4), device=self.device)
+        obj_quat[:, 0] = qw.squeeze(-1)  # w
+        obj_quat[:, 3] = qz.squeeze(-1)  # z
+        # write to sim (offset by env origins)
+        obj_pos += self.scene.env_origins[env_ids]
+        self.assembly_object.write_root_pose_to_sim(
+            torch.cat([obj_pos, obj_quat], dim=-1), env_ids
+        )
+        self.assembly_object.write_root_velocity_to_sim(
+            torch.zeros((len(env_ids), 6), device=self.device), env_ids
+        )
 
-        default_root_state = self.robot.data.default_root_state[env_ids]
-        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+        # Goal fixture pose (fixed): position in each environment
+        goal_p, goal_q = self.cfg.goal_fixture.pose_w
+        goal_pos = torch.tensor(goal_p, device=self.device).unsqueeze(0).expand(len(env_ids), -1)
+        goal_quat = torch.tensor(goal_q, device=self.device).unsqueeze(0).expand(len(env_ids), -1)
+        
+        # Offset by environment origins
+        goal_pos += self.scene.env_origins[env_ids]
+        self.goal_fixture.write_root_pose_to_sim(
+            torch.cat([goal_pos, goal_quat], dim=-1), env_ids
+        )
+        self.goal_fixture.write_root_velocity_to_sim(
+            torch.zeros((len(env_ids), 6), device=self.device), env_ids
+        )
 
-        self.joint_pos[env_ids] = joint_pos
-        self.joint_vel[env_ids] = joint_vel
+        # Cache goal tensors for fast checks (global frame)
+        self._goal_pos = torch.tensor(goal_p, device=self.device).unsqueeze(0)
+        self._goal_quat = torch.tensor(goal_q, device=self.device).unsqueeze(0)
 
-        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        # Reset success timer
+        self._success_hold_buf[env_ids] = 0.0
 
+        # Reset OSC internals
+        self.osc_1.reset()
+        self.osc_2.reset()
 
-@torch.jit.script
-def normalize_angle(angle):
-    return (angle + math.pi) % (2 * math.pi) - math.pi
+    # -----------------------------
+    # Internals
+    # -----------------------------
+    def _setup_osc_controllers(self):
+        osc_cfg = OperationalSpaceControllerCfg(
+            target_types=["pose_abs", "wrench_abs"],
+            impedance_mode="variable_kp",          # adds +6 Kp to command
+            motion_damping_ratio_task=1.0,
+            gravity_compensation=True,
+            nullspace_control="position",
+        )
+        self.osc_1 = OperationalSpaceController(osc_cfg, num_envs=self.scene.num_envs, device=self.device)
+        self.osc_2 = OperationalSpaceController(osc_cfg, num_envs=self.scene.num_envs, device=self.device)
 
+    def _cache_robot_indices(self):
+        # Frames / joints
+        ee_name = "panda_hand"
+        self.ee_frame_idx_1 = self.robot1.find_bodies(ee_name)[0][0]
+        self.ee_frame_idx_2 = self.robot2.find_bodies(ee_name)[0][0]
+        # 7 DoF arm joints
+        self.arm_joint_ids_1 = self.robot1.find_joints(["panda_joint.*"])[0]
+        self.arm_joint_ids_2 = self.robot2.find_joints(["panda_joint.*"])[0]
 
-@torch.jit.script
-def compute_rewards(
-    rew_scale_alive: float,
-    rew_scale_terminated: float,
-    rew_scale_cart_pos: float,
-    rew_scale_cart_vel: float,
-    rew_scale_pole_pos: float,
-    rew_scale_pole_vel: float,
-    rew_scale_pendulum_pos: float,
-    rew_scale_pendulum_vel: float,
-    cart_pos: torch.Tensor,
-    cart_vel: torch.Tensor,
-    pole_pos: torch.Tensor,
-    pole_vel: torch.Tensor,
-    pendulum_pos: torch.Tensor,
-    pendulum_vel: torch.Tensor,
-    reset_terminated: torch.Tensor,
-):
-    rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
-    rew_termination = rew_scale_terminated * reset_terminated.float()
-    rew_pole_pos = rew_scale_pole_pos * torch.sum(torch.square(pole_pos).unsqueeze(dim=1), dim=-1)
-    rew_pendulum_pos = rew_scale_pendulum_pos * torch.sum(
-        torch.square(pole_pos + pendulum_pos).unsqueeze(dim=1), dim=-1
-    )
-    rew_cart_vel = rew_scale_cart_vel * torch.sum(torch.abs(cart_vel).unsqueeze(dim=1), dim=-1)
-    rew_pole_vel = rew_scale_pole_vel * torch.sum(torch.abs(pole_vel).unsqueeze(dim=1), dim=-1)
-    rew_pendulum_vel = rew_scale_pendulum_vel * torch.sum(torch.abs(pendulum_vel).unsqueeze(dim=1), dim=-1)
+        # Cache for object/goal pose tensors
+        gp, gq = self.cfg.goal_fixture.pose_w
+        self._goal_pos = torch.tensor(gp, device=self.device).unsqueeze(0)
+        self._goal_quat = torch.tensor(gq, device=self.device).unsqueeze(0)
 
-    total_reward = {
-        "cart": rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel,
-        "pendulum": rew_alive + rew_termination + rew_pendulum_pos + rew_pendulum_vel,
-    }
-    return total_reward
+    def _prepare_kp_bounds(self):
+        self._kp_min = torch.tensor(self.cfg.kp_min_task, device=self.device).unsqueeze(0)  # (1,6)
+        self._kp_max = torch.tensor(self.cfg.kp_max_task, device=self.device).unsqueeze(0)  # (1,6)
+
+    def _build_osc_command(self, action_motion: torch.Tensor, action_stiff: torch.Tensor) -> torch.Tensor:
+        # action_motion: [pos(3), quat(wxyz)(4), force(3), torque(3)]
+        pose = action_motion[:, :7]
+        # normalize quaternion (w,x,y,z)
+        pose[:, 3:7] = torch.nn.functional.normalize(pose[:, 3:7], dim=-1)
+
+        wrench = action_motion[:, 7:13]
+        # clamp wrench by cfg limits
+        force = torch.clamp(wrench[:, 0:3], min=-self.cfg.max_force, max=self.cfg.max_force)
+        torque = torch.clamp(wrench[:, 3:6], min=-self.cfg.max_torque, max=self.cfg.max_torque)
+        wrench = torch.cat([force, torque], dim=-1)
+
+        # stiffness map from [-1,1] to [kp_min, kp_max]
+        kp_raw = action_stiff[:, :6]
+        kp = 0.5 * (kp_raw + 1.0) * (self._kp_max - self._kp_min) + self._kp_min
+
+        return torch.cat([pose, wrench, kp], dim=-1)  # (N, 19)
+
+    def _set_osc_command(self, robot: Articulation, osc: OperationalSpaceController, ee_frame_idx: int, command: torch.Tensor):
+        ee_pose_b, _ = self._ee_state(robot, ee_frame_idx)
+        osc.set_command(command=command, current_ee_pose_b=ee_pose_b, current_task_frame_pose_b=ee_pose_b)
+
+    def _apply_osc_control(self, robot, osc, ee_frame_idx, arm_joint_ids, joint_centers):
+        jacobian_b, mass_matrix, gravity = self._get_robot_dynamics(robot, ee_frame_idx, arm_joint_ids)
+        ee_pose_b, ee_vel_b = self._ee_state(robot, ee_frame_idx)
+        # FIXED: Pass full 6D wrench instead of only 3D force
+        ee_force_b = self._get_ee_force(robot, ee_frame_idx)  # (N,6) – pass full wrench
+
+        q = robot.data.joint_pos[:, arm_joint_ids]
+        qd = robot.data.joint_vel[:, arm_joint_ids]
+
+        tau = osc.compute(
+            jacobian_b=jacobian_b,
+            current_ee_pose_b=ee_pose_b,
+            current_ee_vel_b=ee_vel_b,
+            current_ee_force_b=ee_force_b,
+            mass_matrix=mass_matrix,
+            gravity=gravity,
+            current_joint_pos=q,
+            current_joint_vel=qd,
+            nullspace_joint_pos_target=joint_centers,
+        )
+        robot.set_joint_effort_target(tau, joint_ids=arm_joint_ids)
+
+    def _get_robot_dynamics(self, robot, ee_frame_idx, arm_joint_ids):
+        ee_jacobi_idx = ee_frame_idx - 1  # per-physx indexing quirk
+        jacobian_w = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, arm_joint_ids]
+        mass_matrix = robot.root_physx_view.get_generalized_mass_matrices()[:, arm_joint_ids, :][:, :, arm_joint_ids]
+        gravity = robot.root_physx_view.get_gravity_compensation_forces()[:, arm_joint_ids]
+
+        # world->body frame (root)
+        Rwb = matrix_from_quat(quat_inv(robot.data.root_quat_w))
+        jacobian_b = jacobian_w.clone()
+        jacobian_b[:, :3, :] = torch.bmm(Rwb, jacobian_b[:, :3, :])
+        jacobian_b[:, 3:, :] = torch.bmm(Rwb, jacobian_b[:, 3:, :])
+        return jacobian_b, mass_matrix, gravity
+
+    def _ee_state(self, robot, ee_frame_idx):
+        root_pos_w = robot.data.root_pos_w
+        root_quat_w = robot.data.root_quat_w
+        ee_pos_w = robot.data.body_pos_w[:, ee_frame_idx]
+        ee_quat_w = robot.data.body_quat_w[:, ee_frame_idx]
+
+        ee_pos_b, ee_quat_b = subtract_frame_transforms(root_pos_w, root_quat_w, ee_pos_w, ee_quat_w)
+        ee_pose_b = torch.cat([ee_pos_b, ee_quat_b], dim=-1)
+
+        ee_vel_w = robot.data.body_vel_w[:, ee_frame_idx, :]
+        root_vel_w = robot.data.root_vel_w
+        rel_vel_w = ee_vel_w - root_vel_w
+        ee_lin_vel_b = quat_apply_inverse(root_quat_w, rel_vel_w[:, 0:3])
+        ee_ang_vel_b = quat_apply_inverse(root_quat_w, rel_vel_w[:, 3:6])
+        ee_vel_b = torch.cat([ee_lin_vel_b, ee_ang_vel_b], dim=-1)
+        return ee_pose_b, ee_vel_b
+
+    def _get_ee_force(self, robot, ee_frame_idx):
+        # Placeholder: use contact sensors if available; else zeros
+        return torch.zeros(self.scene.num_envs, 6, device=self.device)
+
+    # -----------------------------
+    # Observations / Rewards / Dones helpers
+    # -----------------------------
+    def _build_observation(self) -> torch.Tensor:
+        # Joint states
+        q1 = self.robot1.data.joint_pos[:, self.arm_joint_ids_1]
+        qd1 = self.robot1.data.joint_vel[:, self.arm_joint_ids_1]
+        q2 = self.robot2.data.joint_pos[:, self.arm_joint_ids_2]
+        qd2 = self.robot2.data.joint_vel[:, self.arm_joint_ids_2]
+
+        # EE poses (world)
+        ee1_pose_w = torch.cat(
+            [self.robot1.data.body_pos_w[:, self.ee_frame_idx_1], self.robot1.data.body_quat_w[:, self.ee_frame_idx_1]],
+            dim=-1,
+        )
+        ee2_pose_w = torch.cat(
+            [self.robot2.data.body_pos_w[:, self.ee_frame_idx_2], self.robot2.data.body_quat_w[:, self.ee_frame_idx_2]],
+            dim=-1,
+        )
+
+        # Object & goal poses
+        obj_pose = torch.cat([self.assembly_object.data.root_pos_w, self.assembly_object.data.root_quat_w], dim=-1)
+        goal_pose = self._goal_pose_batch()
+
+        # Wrenches (measured; placeholder zeros)
+        w1 = self._get_ee_force(self.robot1, self.ee_frame_idx_1)
+        w2 = self._get_ee_force(self.robot2, self.ee_frame_idx_2)
+
+        obs_parts = [
+            q1, qd1, q2, qd2, ee1_pose_w, ee2_pose_w, obj_pose, goal_pose, w1, w2
+        ]
+        obs = torch.cat([p.view(self.scene.num_envs, -1) for p in obs_parts], dim=-1)
+
+        # Pad/truncate to cfg._OBS_DIM if needed
+        target_dim = self.cfg._OBS_DIM
+        if obs.shape[-1] < target_dim:
+            pad = torch.zeros(self.scene.num_envs, target_dim - obs.shape[-1], device=self.device)
+            obs = torch.cat([obs, pad], dim=-1)
+        elif obs.shape[-1] > target_dim:
+            obs = obs[:, :target_dim]
+        return obs
+
+    def _goal_pose_batch(self) -> torch.Tensor:
+        return torch.cat([self._goal_pos.expand(self.scene.num_envs, -1),
+                          self._goal_quat.expand(self.scene.num_envs, -1)], dim=-1)
+
+    def _compute_robot_rewards(self, robot_id: int) -> dict[str, torch.Tensor]:
+        # Select per-robot handles
+        if robot_id == 1:
+            ee_pose = torch.cat(
+                [self.robot1.data.body_pos_w[:, self.ee_frame_idx_1],
+                 self.robot1.data.body_quat_w[:, self.ee_frame_idx_1]], dim=-1)
+            motion_key, stiff_key = "robot1_motion", "robot1_stiffness"
+        else:
+            ee_pose = torch.cat(
+                [self.robot2.data.body_pos_w[:, self.ee_frame_idx_2],
+                 self.robot2.data.body_quat_w[:, self.ee_frame_idx_2]], dim=-1)
+            motion_key, stiff_key = "robot2_motion", "robot2_stiffness"
+
+        # Distances: EE to object grasp (use object COM as proxy) and object to goal
+        ee_pos = ee_pose[:, :3]
+        obj_pos = self.assembly_object.data.root_pos_w
+        goal_pos = self._goal_pos.expand_as(obj_pos)
+
+        d_grasp = torch.norm(ee_pos - obj_pos, dim=-1)
+        d_goal = torch.norm(obj_pos - goal_pos, dim=-1)
+        distance_reward = -self.cfg.distance_reward_scale * (d_grasp + d_goal)
+
+        # Orientation (simple quat alignment object->goal)
+        obj_quat = self.assembly_object.data.root_quat_w
+        goal_quat = self._goal_quat.expand_as(obj_quat)
+        ori_dot = torch.sum(obj_quat * goal_quat, dim=-1).abs().clamp(max=1.0)
+        orientation_reward = self.cfg.orientation_reward_scale * ori_dot
+
+        # Coordination (keep object level / synchronized)
+        # Use small penalty for deviation of object height from goal height
+        coord_err = torch.abs(obj_pos[:, 2] - goal_pos[:, 2])
+        coordination_reward = -self.cfg.coordination_reward_scale * coord_err
+
+        base = distance_reward + orientation_reward + coordination_reward
+
+        # Action penalties
+        a_m = self._last_actions.get(motion_key, torch.zeros(self.scene.num_envs, 13, device=self.device))
+        a_s = self._last_actions.get(stiff_key, torch.zeros(self.scene.num_envs, 6, device=self.device))
+        motion_pen = -self.cfg.action_penalty_scale_motion * torch.sum(a_m * a_m, dim=-1)
+        stiff_pen = -self.cfg.action_penalty_scale_stiffness * torch.sum(a_s * a_s, dim=-1)
+
+        # Compliance term: bonus for low Kp under (proxy) contact: when EE near object
+        near_contact = (d_grasp < 0.10).float().unsqueeze(-1)  # (N,1)
+        # map stiffness to [kp_min, kp_max] to compute effective magnitude
+        kp = 0.5 * (a_s + 1.0) * (self._kp_max - self._kp_min) + self._kp_min  # (N,6)
+        # lower kp -> higher bonus when near contact
+        stiffness_terms = stiff_pen + self.cfg.compliance_contact_bonus * near_contact.squeeze(-1) * (
+            1.0 - torch.tanh(kp.mean(dim=-1) / self._kp_max.mean())
+        )
+
+        # Conflict term (only for motion agents): penalize opposing forces
+        f1 = self._extract_force(self._last_actions.get("robot1_motion"))
+        f2 = self._extract_force(self._last_actions.get("robot2_motion"))
+        # conflict = -β * max(0, -F1·F2)
+        dot = torch.sum(f1 * f2, dim=-1)
+        conflict_pen = -self.cfg.conflict_force_penalty_scale * torch.clamp(-dot, min=0.0)
+        motion_terms = motion_pen
+        conflict_terms = conflict_pen
+
+        # Task completion sparse bonus distributed to both robots
+        success_bonus = self._success_bonus()
+        base = base + success_bonus
+
+        return {"base": base, "motion_terms": motion_terms, "stiffness_terms": stiffness_terms, "conflict_terms": conflict_terms}
+
+    def _extract_force(self, a_m: torch.Tensor | None) -> torch.Tensor:
+        if a_m is None:
+            return torch.zeros(self.scene.num_envs, 3, device=self.device)
+        return a_m[:, 7:10].clamp(min=-self.cfg.max_force, max=self.cfg.max_force)
+
+    def _success_bonus(self) -> torch.Tensor:
+        # Provide bonus when success condition is already met this step
+        obj_pos = self.assembly_object.data.root_pos_w
+        goal_pos = self._goal_pos.expand_as(obj_pos)
+        pos_ok = torch.norm(obj_pos - goal_pos, dim=-1) < self.cfg.success_position_threshold
+        stable = self._object_stable_mask()
+        hit = pos_ok & stable
+        return torch.where(hit, torch.full_like(pos_ok, self.cfg.task_completion_reward, dtype=torch.float32), 0.0)
+
+    def _object_stable_mask(self) -> torch.Tensor:
+        vel = self.assembly_object.data.root_vel_w
+        lin = torch.norm(vel[:, :3], dim=-1)
+        ang = torch.norm(vel[:, 3:], dim=-1)
+        return (lin < 0.05) & (ang < 0.2)
+
+    def _safety_limit_exceeded(self) -> torch.Tensor:
+        # Use commanded forces as proxy if no sensor (conservative)
+        f1 = self._extract_force(self._last_actions.get("robot1_motion"))
+        f2 = self._extract_force(self._last_actions.get("robot2_motion"))
+        fmag = torch.max(torch.norm(f1, dim=-1), torch.norm(f2, dim=-1))
+        return (fmag > self.cfg.safety_force_limit)
