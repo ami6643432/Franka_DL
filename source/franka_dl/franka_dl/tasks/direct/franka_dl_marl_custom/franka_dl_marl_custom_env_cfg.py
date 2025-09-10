@@ -130,7 +130,9 @@ class FrankaDlMarlCustomEnvCfg(DirectMARLEnvCfg):
             pos=(0.0, 0.50, 0.0),
         ),
         actuators={
-            "arm": ImplicitActuatorCfg(joint_names_expr=["panda_joint.*"], stiffness=80.0, damping=8.0),
+            # Torque-mode plant for arm: disable internal PD
+            "arm": ImplicitActuatorCfg(joint_names_expr=["panda_joint.*"], stiffness=0.0, damping=0.0),
+            # Keep gripper PD as-is
             "hand": ImplicitActuatorCfg(joint_names_expr=["panda_finger_joint.*"], stiffness=2e3, damping=1e2)
         }
     )
@@ -148,7 +150,7 @@ class FrankaDlMarlCustomEnvCfg(DirectMARLEnvCfg):
             pos=(0.0, -0.50, 0.0),
         ),
         actuators={
-            "arm": ImplicitActuatorCfg(joint_names_expr=["panda_joint.*"], stiffness=80.0, damping=8.0),
+            "arm": ImplicitActuatorCfg(joint_names_expr=["panda_joint.*"], stiffness=0.0, damping=0.0),
             "hand": ImplicitActuatorCfg(joint_names_expr=["panda_finger_joint.*"], stiffness=2e3, damping=1e2)
         }
     )
@@ -259,3 +261,14 @@ class FrankaDlMarlCustomEnvCfg(DirectMARLEnvCfg):
     # Scalars apply to all 7 arm joints; provide a length-7 tuple to set per-joint gains.
     pd_kp_joint: float | tuple[float, float, float, float, float, float, float] = 150.0
     pd_kd_joint: float | tuple[float, float, float, float, float, float, float] = 25.0
+
+    # --- Actuator dynamics (torque-mode) for Panda (brochure-based)
+    # Joint torque limits (Nm): J1-4 high torque, J5-7 smaller torque
+    act_tau_max: tuple[float, float, float, float, float, float, float] = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
+    # Inner torque/current loop time constant (~2–5 ms)
+    act_time_constant_s: float | tuple[float, float, float, float, float, float, float] = 0.005
+    # Torque rate limit (Nm/s) — higher for proximal joints
+    act_tau_rate_limit: tuple[float, float, float, float, float, float, float] = (2000.0, 2000.0, 2000.0, 2000.0, 800.0, 800.0, 800.0)
+    # Simple friction model
+    act_coulomb_friction: tuple[float, float, float, float, float, float, float] = (0.8, 0.8, 0.6, 0.5, 0.3, 0.25, 0.2)
+    act_viscous_friction: tuple[float, float, float, float, float, float, float] = (0.08, 0.08, 0.06, 0.05, 0.03, 0.03, 0.02)

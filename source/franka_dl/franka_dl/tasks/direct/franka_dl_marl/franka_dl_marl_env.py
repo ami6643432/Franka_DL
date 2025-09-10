@@ -13,6 +13,8 @@ from isaaclab.envs import DirectMARLEnv
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.sim.spawners.from_files import spawn_from_usd
+from isaaclab.terrains import TerrainImporter
 from isaaclab.utils.math import (
     matrix_from_quat,
     quat_apply_inverse,
@@ -51,8 +53,14 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         self._last_actions: dict[str, torch.Tensor] = {}
 
         # Joint centers (nullspace targets) – only arm joints for OSC
-        self._joint_centers_1 = self.robot1.data.default_joint_pos[:, self.arm_joint_ids_1].clone()
+        self._joint_centers_1 = self.robot.data.default_joint_pos[:, self.arm_joint_ids_1].clone()
         self._joint_centers_2 = self.robot2.data.default_joint_pos[:, self.arm_joint_ids_2].clone()
+        
+        # Store initial end-effector poses for fixed action testing
+        self._initial_ee1_pos = None
+        self._initial_ee1_quat = None
+        self._initial_ee2_pos = None
+        self._initial_ee2_quat = None
 
     def _setup_visualization(self):
         """Set up visualization markers for debugging."""
@@ -62,27 +70,34 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         self.visualization_markers = VisualizationMarkers(marker_cfg)
 
     def _setup_scene(self):
-        """Spawn two Frankas, ground, assembly object, and goal fixture."""
+        """Spawn two Frankas, ground, rod object, and goal fixture."""
         # Clone and replicate environments FIRST
         self.scene.clone_environments(copy_from_source=False)
         
         # Create robots
-        self.robot1 = Articulation(self.cfg.robot1)
+        self.robot = Articulation(self.cfg.robot)
         self.robot2 = Articulation(self.cfg.robot2)
 
         # Ground
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # Assembly object (dynamic)
-        self.assembly_object = RigidObject(self.cfg.assembly_object)
+        # Table
+        self.table = RigidObject(self.cfg.table)
+
+        # Terrain
+        self.terrain = TerrainImporter(self.cfg.terrain)
+
+        # Rod object (dynamic)
+        self.rod = RigidObject(self.cfg.rod)
 
         # Goal fixture (kinematic)
         self.goal_fixture = RigidObject(self.cfg.goal_fixture)
         
         # Register assets to scene collections
-        self.scene.articulations["robot1"] = self.robot1
+        self.scene.articulations["robot"] = self.robot
         self.scene.articulations["robot2"] = self.robot2
-        self.scene.rigid_objects["assembly_object"] = self.assembly_object
+        self.scene.rigid_objects["table"] = self.table
+        self.scene.rigid_objects["rod"] = self.rod
         self.scene.rigid_objects["goal_fixture"] = self.goal_fixture
 
         # Lighting
@@ -92,23 +107,77 @@ class FrankaDlMarlEnv(DirectMARLEnv):
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         """Combine per-robot actions (motion + stiffness) -> 19D OSC commands."""
         self._last_actions = actions  # for rewards
-
-        # Robot 1
-        a1_m = actions["robot1_motion"]        # (N, 13): [pose7 | wrench6]
-        a1_s = actions["robot1_stiffness"]     # (N, 6):  [Kp6]
+        
+        # TESTING: Use fixed dummy actions instead of agent actions
+        # Comment out these lines when not testing
+        fixed_actions = True  # Set to False to use original actions
+        if fixed_actions:
+            # Capture initial poses only once (first step after reset)
+            if self._initial_ee1_pos is None:
+                self._initial_ee1_pos = self.robot.data.body_pos_w[:, self.ee_frame_idx_1].clone()
+                self._initial_ee1_quat = self.robot.data.body_quat_w[:, self.ee_frame_idx_1].clone()
+                self._initial_ee2_pos = self.robot2.data.body_pos_w[:, self.ee_frame_idx_2].clone()
+                self._initial_ee2_quat = self.robot2.data.body_quat_w[:, self.ee_frame_idx_2].clone()
+                print("Captured initial poses for fixed action testing")
+            
+            # Robot 1 motion: hold initial pose with zero forces/torques
+            a1_m = torch.cat([
+                self._initial_ee1_pos,   # Initial position XYZ (fixed)
+                self._initial_ee1_quat,  # Initial orientation (quat) (fixed)
+                torch.zeros(self.scene.num_envs, 6, device=self.device)  # Zero forces and torques
+            ], dim=-1)
+            
+            # Robot 1 stiffness: maximum values for pure position holding
+            a1_s = torch.tensor([
+                # Maximum stiffness for XYZ and RPY axes (pure position hold mode)
+                1.0, 1.0, 1.0,    1.0, 1.0, 1.0
+            ], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
+            
+            # Robot 2 motion: hold initial pose with zero forces/torques
+            a2_m = torch.cat([
+                self._initial_ee2_pos,   # Initial position XYZ (fixed)
+                self._initial_ee2_quat,  # Initial orientation (quat) (fixed)
+                torch.zeros(self.scene.num_envs, 6, device=self.device)  # Zero forces and torques
+            ], dim=-1)
+            
+            # Robot 2 stiffness: maximum values for pure position holding
+            a2_s = torch.tensor([
+                # Maximum stiffness for XYZ and RPY axes (pure position hold mode)
+                1.0, 1.0, 1.0,    1.0, 1.0, 1.0
+            ], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
+            
+            # Print debug info every 60 steps (approximately once per second)
+            if hasattr(self, 'step_counter'):
+                self.step_counter += 1
+            else:
+                self.step_counter = 0
+                
+            if self.step_counter % 60 == 0:
+                print(f"Step {self.step_counter}: Using fixed test actions")
+                ee_pose1 = self.robot.data.body_pos_w[:, self.ee_frame_idx_1]
+                print(f"  Robot 1 EE pos: {ee_pose1[0].cpu().numpy()}")
+                ee_pose2 = self.robot2.data.body_pos_w[:, self.ee_frame_idx_2]
+                print(f"  Robot 2 EE pos: {ee_pose2[0].cpu().numpy()}")
+                rod_pos = self.rod.data.root_pos_w[0]
+                print(f"  Rod position: {rod_pos.cpu().numpy()}")
+        else:
+            # Original code: use actions from agents
+            a1_m = actions["robot_motion"]        # (N, 13): [pose7 | wrench6]
+            a1_s = actions["robot_stiffness"]     # (N, 6):  [Kp6]
+            a2_m = actions["robot2_motion"]
+            a2_s = actions["robot2_stiffness"]
+        
         cmd1 = self._build_osc_command(a1_m, a1_s)  # (N, 19)
-        self._set_osc_command(self.robot1, self.osc_1, self.ee_frame_idx_1, cmd1)
+        self._set_osc_command(self.robot, self.osc_1, self.ee_frame_idx_1, cmd1)
 
         # Robot 2
-        a2_m = actions["robot2_motion"]
-        a2_s = actions["robot2_stiffness"]
         cmd2 = self._build_osc_command(a2_m, a2_s)
         self._set_osc_command(self.robot2, self.osc_2, self.ee_frame_idx_2, cmd2)
-
+    
     def _apply_action(self) -> None:
         """Compute torques via OSC and apply to both robots."""
         self._apply_osc_control(
-            self.robot1, self.osc_1, self.ee_frame_idx_1, self.arm_joint_ids_1, self._joint_centers_1
+            self.robot, self.osc_1, self.ee_frame_idx_1, self.arm_joint_ids_1, self._joint_centers_1
         )
         self._apply_osc_control(
             self.robot2, self.osc_2, self.ee_frame_idx_2, self.arm_joint_ids_2, self._joint_centers_2
@@ -118,8 +187,8 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         """Same global observation to all agents."""
         obs_global = self._build_observation()
         return {
-            "robot1_motion": obs_global,
-            "robot1_stiffness": obs_global,
+            "robot_motion": obs_global,
+            "robot_stiffness": obs_global,
             "robot2_motion": obs_global,
             "robot2_stiffness": obs_global,
         }
@@ -141,8 +210,8 @@ class FrankaDlMarlEnv(DirectMARLEnv):
 
         # Split/assign per agent
         return {
-            "robot1_motion": rew1["base"] + rew1["motion_terms"] + rew1["conflict_terms"],
-            "robot1_stiffness": rew1["base"] + rew1["stiffness_terms"],
+            "robot_motion": rew1["base"] + rew1["motion_terms"] + rew1["conflict_terms"],
+            "robot_stiffness": rew1["base"] + rew1["stiffness_terms"],
             "robot2_motion": rew2["base"] + rew2["motion_terms"] + rew2["conflict_terms"],
             "robot2_stiffness": rew2["base"] + rew2["stiffness_terms"],
         }
@@ -152,8 +221,8 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         # Success: object near goal for hold time
-        obj_pos = self.assembly_object.data.root_pos_w
-        obj_quat = self.assembly_object.data.root_quat_w
+        obj_pos = self.rod.data.root_pos_w
+        obj_quat = self.rod.data.root_quat_w
         goal_pos = self._goal_pos.expand_as(obj_pos)
         goal_quat = self._goal_quat.expand_as(obj_quat)
 
@@ -175,14 +244,14 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         unsafe = self._safety_limit_exceeded()
 
         terminated = {
-            "robot1_motion": success | dropped | unsafe,
-            "robot1_stiffness": success | dropped | unsafe,
+            "robot_motion": success | dropped | unsafe,
+            "robot_stiffness": success | dropped | unsafe,
             "robot2_motion": success | dropped | unsafe,
             "robot2_stiffness": success | dropped | unsafe,
         }
         timeouts = {
-            "robot1_motion": time_out,
-            "robot1_stiffness": time_out,
+            "robot_motion": time_out,
+            "robot_stiffness": time_out,
             "robot2_motion": time_out,
             "robot2_stiffness": time_out,
         }
@@ -190,11 +259,11 @@ class FrankaDlMarlEnv(DirectMARLEnv):
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
-            env_ids = self.robot1._ALL_INDICES
+            env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
 
         # Reset robots to defaults (per env origin)
-        for robot in (self.robot1, self.robot2):
+        for robot in (self.robot, self.robot2):
             joint_pos = robot.data.default_joint_pos[env_ids]
             joint_vel = robot.data.default_joint_vel[env_ids]
             robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -205,10 +274,10 @@ class FrankaDlMarlEnv(DirectMARLEnv):
             robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
 
         # Reset object: place on table between robots with random XY & yaw
-        h = self.cfg.assembly_object.tabletop_height
+        h = self.cfg.rod.tabletop_height + 0.02  # Table surface height + radius of rod
         pos_xy = sample_uniform(
-            lower=torch.tensor([-0.10, -0.15], device=self.device),
-            upper=torch.tensor([0.10, 0.15], device=self.device),
+            lower=torch.tensor([0.50, -0.15], device=self.device),  # Above table area
+            upper=torch.tensor([1.00, 0.15], device=self.device),
             size=(len(env_ids), 2),
             device=self.device
         )
@@ -218,22 +287,36 @@ class FrankaDlMarlEnv(DirectMARLEnv):
             size=(len(env_ids), 1),
             device=self.device
         )
-        # yaw -> quat (w,x,y,z) assuming Z-rotation only
+        # Start with horizontal orientation from config, then add random yaw
+        # Base horizontal orientation: (0.7071068, 0.0, 0.7071068, 0.0)
+        qw_base = 0.7071068
+        qx_base = 0.0
+        qy_base = 0.7071068
+        qz_base = 0.0
+        
+        # Random yaw rotation around Z-axis
         half = 0.5 * yaw
-        qz = torch.sin(half)
-        qw = torch.cos(half)
+        qz_yaw = torch.sin(half)
+        qw_yaw = torch.cos(half)
+        qx_yaw = torch.zeros_like(half)
+        qy_yaw = torch.zeros_like(half)
+        
+        # Combine base horizontal + yaw: q_total = q_yaw * q_base
         obj_pos = torch.zeros((len(env_ids), 3), device=self.device)
         obj_pos[:, 0:2] = pos_xy
-        obj_pos[:, 2] = h + 0.5 * self.cfg.assembly_object.size_xyz[2]
+        obj_pos[:, 2] = h  # Rod center at table surface + radius
         obj_quat = torch.zeros((len(env_ids), 4), device=self.device)
-        obj_quat[:, 0] = qw.squeeze(-1)  # w
-        obj_quat[:, 3] = qz.squeeze(-1)  # z
+        # Quaternion multiplication: q_yaw * q_base
+        obj_quat[:, 0] = (qw_yaw * qw_base - qx_yaw * qx_base - qy_yaw * qy_base - qz_yaw * qz_base).squeeze(-1)  # w
+        obj_quat[:, 1] = (qw_yaw * qx_base + qx_yaw * qw_base + qy_yaw * qz_base - qz_yaw * qy_base).squeeze(-1)  # x
+        obj_quat[:, 2] = (qw_yaw * qy_base - qx_yaw * qz_base + qy_yaw * qw_base + qz_yaw * qx_base).squeeze(-1)  # y
+        obj_quat[:, 3] = (qw_yaw * qz_base + qx_yaw * qy_base - qy_yaw * qx_base + qz_yaw * qw_base).squeeze(-1)  # z
         # write to sim (offset by env origins)
         obj_pos += self.scene.env_origins[env_ids]
-        self.assembly_object.write_root_pose_to_sim(
+        self.rod.write_root_pose_to_sim(
             torch.cat([obj_pos, obj_quat], dim=-1), env_ids
         )
-        self.assembly_object.write_root_velocity_to_sim(
+        self.rod.write_root_velocity_to_sim(
             torch.zeros((len(env_ids), 6), device=self.device), env_ids
         )
 
@@ -261,6 +344,12 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         # Reset OSC internals
         self.osc_1.reset()
         self.osc_2.reset()
+        
+        # Reset initial pose storage for fixed action testing
+        self._initial_ee1_pos = None
+        self._initial_ee1_quat = None
+        self._initial_ee2_pos = None
+        self._initial_ee2_quat = None
 
     # -----------------------------
     # Internals
@@ -269,7 +358,7 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         osc_cfg = OperationalSpaceControllerCfg(
             target_types=["pose_abs", "wrench_abs"],
             impedance_mode="variable_kp",          # adds +6 Kp to command
-            motion_damping_ratio_task=1.0,
+            motion_damping_ratio_task=2.0,         # Overdamped for pure position hold
             gravity_compensation=True,
             nullspace_control="position",
         )
@@ -279,10 +368,10 @@ class FrankaDlMarlEnv(DirectMARLEnv):
     def _cache_robot_indices(self):
         # Frames / joints
         ee_name = "panda_hand"
-        self.ee_frame_idx_1 = self.robot1.find_bodies(ee_name)[0][0]
+        self.ee_frame_idx_1 = self.robot.find_bodies(ee_name)[0][0]
         self.ee_frame_idx_2 = self.robot2.find_bodies(ee_name)[0][0]
         # 7 DoF arm joints
-        self.arm_joint_ids_1 = self.robot1.find_joints(["panda_joint.*"])[0]
+        self.arm_joint_ids_1 = self.robot.find_joints(["panda_joint.*"])[0]
         self.arm_joint_ids_2 = self.robot2.find_joints(["panda_joint.*"])[0]
 
         # Cache for object/goal pose tensors
@@ -377,14 +466,14 @@ class FrankaDlMarlEnv(DirectMARLEnv):
     # -----------------------------
     def _build_observation(self) -> torch.Tensor:
         # Joint states
-        q1 = self.robot1.data.joint_pos[:, self.arm_joint_ids_1]
-        qd1 = self.robot1.data.joint_vel[:, self.arm_joint_ids_1]
+        q1 = self.robot.data.joint_pos[:, self.arm_joint_ids_1]
+        qd1 = self.robot.data.joint_vel[:, self.arm_joint_ids_1]
         q2 = self.robot2.data.joint_pos[:, self.arm_joint_ids_2]
         qd2 = self.robot2.data.joint_vel[:, self.arm_joint_ids_2]
 
         # EE poses (world)
         ee1_pose_w = torch.cat(
-            [self.robot1.data.body_pos_w[:, self.ee_frame_idx_1], self.robot1.data.body_quat_w[:, self.ee_frame_idx_1]],
+            [self.robot.data.body_pos_w[:, self.ee_frame_idx_1], self.robot.data.body_quat_w[:, self.ee_frame_idx_1]],
             dim=-1,
         )
         ee2_pose_w = torch.cat(
@@ -393,11 +482,11 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         )
 
         # Object & goal poses
-        obj_pose = torch.cat([self.assembly_object.data.root_pos_w, self.assembly_object.data.root_quat_w], dim=-1)
+        obj_pose = torch.cat([self.rod.data.root_pos_w, self.rod.data.root_quat_w], dim=-1)
         goal_pose = self._goal_pose_batch()
 
         # Wrenches (measured; placeholder zeros)
-        w1 = self._get_ee_force(self.robot1, self.ee_frame_idx_1)
+        w1 = self._get_ee_force(self.robot, self.ee_frame_idx_1)
         w2 = self._get_ee_force(self.robot2, self.ee_frame_idx_2)
 
         obs_parts = [
@@ -422,9 +511,9 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         # Select per-robot handles
         if robot_id == 1:
             ee_pose = torch.cat(
-                [self.robot1.data.body_pos_w[:, self.ee_frame_idx_1],
-                 self.robot1.data.body_quat_w[:, self.ee_frame_idx_1]], dim=-1)
-            motion_key, stiff_key = "robot1_motion", "robot1_stiffness"
+                [self.robot.data.body_pos_w[:, self.ee_frame_idx_1],
+                 self.robot.data.body_quat_w[:, self.ee_frame_idx_1]], dim=-1)
+            motion_key, stiff_key = "robot_motion", "robot_stiffness"
         else:
             ee_pose = torch.cat(
                 [self.robot2.data.body_pos_w[:, self.ee_frame_idx_2],
@@ -433,7 +522,7 @@ class FrankaDlMarlEnv(DirectMARLEnv):
 
         # Distances: EE to object grasp (use object COM as proxy) and object to goal
         ee_pos = ee_pose[:, :3]
-        obj_pos = self.assembly_object.data.root_pos_w
+        obj_pos = self.rod.data.root_pos_w
         goal_pos = self._goal_pos.expand_as(obj_pos)
 
         d_grasp = torch.norm(ee_pos - obj_pos, dim=-1)
@@ -441,7 +530,7 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         distance_reward = -self.cfg.distance_reward_scale * (d_grasp + d_goal)
 
         # Orientation (simple quat alignment object->goal)
-        obj_quat = self.assembly_object.data.root_quat_w
+        obj_quat = self.rod.data.root_quat_w
         goal_quat = self._goal_quat.expand_as(obj_quat)
         ori_dot = torch.sum(obj_quat * goal_quat, dim=-1).abs().clamp(max=1.0)
         orientation_reward = self.cfg.orientation_reward_scale * ori_dot
@@ -469,7 +558,7 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         )
 
         # Conflict term (only for motion agents): penalize opposing forces
-        f1 = self._extract_force(self._last_actions.get("robot1_motion"))
+        f1 = self._extract_force(self._last_actions.get("robot_motion"))
         f2 = self._extract_force(self._last_actions.get("robot2_motion"))
         # conflict = -β * max(0, -F1·F2)
         dot = torch.sum(f1 * f2, dim=-1)
@@ -490,7 +579,7 @@ class FrankaDlMarlEnv(DirectMARLEnv):
 
     def _success_bonus(self) -> torch.Tensor:
         # Provide bonus when success condition is already met this step
-        obj_pos = self.assembly_object.data.root_pos_w
+        obj_pos = self.rod.data.root_pos_w
         goal_pos = self._goal_pos.expand_as(obj_pos)
         pos_ok = torch.norm(obj_pos - goal_pos, dim=-1) < self.cfg.success_position_threshold
         stable = self._object_stable_mask()
@@ -498,14 +587,14 @@ class FrankaDlMarlEnv(DirectMARLEnv):
         return torch.where(hit, torch.full_like(pos_ok, self.cfg.task_completion_reward, dtype=torch.float32), 0.0)
 
     def _object_stable_mask(self) -> torch.Tensor:
-        vel = self.assembly_object.data.root_vel_w
+        vel = self.rod.data.root_vel_w
         lin = torch.norm(vel[:, :3], dim=-1)
         ang = torch.norm(vel[:, 3:], dim=-1)
         return (lin < 0.05) & (ang < 0.2)
 
     def _safety_limit_exceeded(self) -> torch.Tensor:
         # Use commanded forces as proxy if no sensor (conservative)
-        f1 = self._extract_force(self._last_actions.get("robot1_motion"))
+        f1 = self._extract_force(self._last_actions.get("robot_motion"))
         f2 = self._extract_force(self._last_actions.get("robot2_motion"))
         fmag = torch.max(torch.norm(f1, dim=-1), torch.norm(f2, dim=-1))
         return (fmag > self.cfg.safety_force_limit)
