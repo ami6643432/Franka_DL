@@ -83,6 +83,15 @@ class FrankaDlMarlCustomEnv(DirectMARLEnv):
         self._hold_targets_1 = None
         self._hold_targets_2 = None
 
+        # Actuator dynamics state and params (torque-mode plant)
+        self._tau_prev_1 = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self._tau_prev_2 = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self._setup_actuator_params()
+        try:
+            print(f"[Init] Torque-mode actuator params: tau_max={self._act_tau_max.flatten().tolist()}, tau_rate={self._act_tau_rate.flatten().tolist()}, tau_tc={float((self._ctrl_dt / self._act_alpha - self._ctrl_dt).mean()) if torch.all(self._act_alpha>0) else 'inf'}s")
+        except Exception:
+            pass
+
     def _setup_visualization(self):
         """Set up visualization markers for debugging."""
         marker_cfg = FRAME_MARKER_CFG.copy()
@@ -359,6 +368,9 @@ class FrankaDlMarlCustomEnv(DirectMARLEnv):
         # Reset joint PD hold targets
         self._hold_targets_1 = None
         self._hold_targets_2 = None
+        # Reset actuator dynamics state
+        self._tau_prev_1[env_ids] = 0.0
+        self._tau_prev_2[env_ids] = 0.0
 
     # -----------------------------
     # Internals
@@ -448,30 +460,29 @@ class FrankaDlMarlCustomEnv(DirectMARLEnv):
         q = robot.data.joint_pos[:, arm_joint_ids]
         qd = robot.data.joint_vel[:, arm_joint_ids]
 
-        # When using joint PD mode, set the joint targets to hold a pose.
-        # Here we hold the default/start arm configuration (joint_centers).
+        # When using joint PD mode, set the joint targets to hold the measured initial pose.
         if isinstance(osc, CustomOperationalSpaceController) and osc.custom_cfg.control_mode == "joint_pd":
             # Initialize per-robot hold targets on first step after reset
             if robot is self.robot:
                 if self._hold_targets_1 is None:
-                    self._hold_targets_1 = torch.zeros_like(q)
+                    self._hold_targets_1 = q.clone()
                     try:
-                        print(f"[HoldInit][R1] q_target (zeros) = {self._hold_targets_1[0].tolist()}")
+                        print(f"[HoldInit][R1] q_target (init) = {self._hold_targets_1[0].tolist()}")
                     except Exception:
                         pass
                 q_target = self._hold_targets_1
             else:
                 if self._hold_targets_2 is None:
-                    self._hold_targets_2 = torch.zeros_like(q)
+                    self._hold_targets_2 = q.clone()
                     try:
-                        print(f"[HoldInit][R2] q_target (zeros) = {self._hold_targets_2[0].tolist()}")
+                        print(f"[HoldInit][R2] q_target (init) = {self._hold_targets_2[0].tolist()}")
                     except Exception:
                         pass
                 q_target = self._hold_targets_2
             qd_target = torch.zeros_like(q)
             osc.set_joint_command(joint_positions=q_target, joint_velocities=qd_target)
 
-        tau = osc.compute(
+        tau_cmd = osc.compute(
             jacobian_b=jacobian_b,
             current_ee_pose_b=ee_pose_b,
             current_ee_vel_b=ee_vel_b,
@@ -482,7 +493,9 @@ class FrankaDlMarlCustomEnv(DirectMARLEnv):
             current_joint_vel=qd,
             nullspace_joint_pos_target=joint_centers,
         )
-        robot.set_joint_effort_target(tau, joint_ids=arm_joint_ids)
+        # Apply actuator dynamics and effort limits before sending to sim
+        tau_applied = self._apply_actuator_dynamics(robot, tau_cmd, qd)
+        robot.set_joint_effort_target(tau_applied, joint_ids=arm_joint_ids)
 
         # Lightweight debug prints to monitor PD behavior
         # Print every 60 steps to avoid spam
@@ -505,12 +518,13 @@ class FrankaDlMarlCustomEnv(DirectMARLEnv):
                     # Print norms for env 0 as representative
                     e_pos = float(pos_err.norm(dim=-1)[0].item())
                     e_vel = float(vel_err.norm(dim=-1)[0].item())
-                    tau_n = float(tau.norm(dim=-1)[0].item())
+                    tau_n = float(tau_cmd.norm(dim=-1)[0].item())
                     g_n = float(gravity.norm(dim=-1)[0].item())
                     dq0 = [round(x, 3) for x in pos_err[0].tolist()]
                     q0 = [round(x, 3) for x in q[0].tolist()]
                     qt0 = [round(x, 3) for x in q_target[0].tolist()]
-                    print(f"[PD Debug][{robot_label}] |e_q|={e_pos:.4f} |e_qd|={e_vel:.4f} kp_mean={kp_mean:.1f} kd_mean={kd_mean:.1f} |tau|={tau_n:.2f} |g|={g_n:.2f}")
+                    tau_appl_n = float(tau_applied.norm(dim=-1)[0].item())
+                    print(f"[PD Debug][{robot_label}] |e_q|={e_pos:.4f} |e_qd|={e_vel:.4f} kp_mean={kp_mean:.1f} kd_mean={kd_mean:.1f} |tau_cmd|={tau_n:.2f} |tau_appl|={tau_appl_n:.2f} |g|={g_n:.2f}")
                     print(f"[PD Debug][{robot_label}] q={q0} q_tgt={qt0} dq={dq0}")
                 else:
                     # OSC mode: print pose error magnitude (if command set)
@@ -519,8 +533,8 @@ class FrankaDlMarlCustomEnv(DirectMARLEnv):
                     q_wxyz = ee_pose_b[:, 3:7]
                     p_n = float(p.norm(dim=-1)[0].item())
                     v_n = float(ee_vel_b.norm(dim=-1)[0].item())
-                    tau_n = float(tau.norm(dim=-1)[0].item())
-                    print(f"[OSC Debug][{robot_label}] |ee_pose_b|={p_n:.3f} |ee_vel_b|={v_n:.3f} |tau|={tau_n:.2f}")
+                    tau_n = float(tau_applied.norm(dim=-1)[0].item())
+                    print(f"[OSC Debug][{robot_label}] |ee_pose_b|={p_n:.3f} |ee_vel_b|={v_n:.3f} |tau_appl|={tau_n:.2f}")
             except Exception as _e:
                 # Best-effort debug; never break control loop
                 pass
@@ -559,6 +573,46 @@ class FrankaDlMarlCustomEnv(DirectMARLEnv):
     def _get_ee_force(self, robot, ee_frame_idx):
         # Placeholder: use contact sensors if available; else zeros
         return torch.zeros(self.scene.num_envs, 6, device=self.device)
+
+    # -----------------------------
+    # Actuator dynamics (torque-mode plant)
+    # -----------------------------
+    def _setup_actuator_params(self):
+        # Controller timestep (after decimation)
+        self._ctrl_dt = self.step_dt * self.cfg.decimation
+        # Convert cfg entries to tensors shaped (1, 7)
+        def _to_tensor7(val):
+            if isinstance(val, (int, float)):
+                return torch.full((1, 7), float(val), device=self.device)
+            t = torch.tensor(val, dtype=torch.float, device=self.device)
+            return t.view(1, -1)
+
+        self._act_tau_max = _to_tensor7(self.cfg.act_tau_max)
+        self._act_tau_rate = _to_tensor7(self.cfg.act_tau_rate_limit)
+        time_const = _to_tensor7(self.cfg.act_time_constant_s)
+        # First-order lag coefficient alpha in [0,1]
+        self._act_alpha = (self._ctrl_dt / (time_const + self._ctrl_dt)).clamp(min=0.0, max=1.0)
+        self._act_coulomb = _to_tensor7(self.cfg.act_coulomb_friction)
+        self._act_viscous = _to_tensor7(self.cfg.act_viscous_friction)
+
+    def _apply_actuator_dynamics(self, robot, tau_cmd: torch.Tensor, qd: torch.Tensor) -> torch.Tensor:
+        # Select previous effort buffer by robot
+        tau_prev = self._tau_prev_1 if robot is self.robot else self._tau_prev_2
+        # Rate limit
+        delta = tau_cmd - tau_prev
+        max_delta = self._act_tau_rate * self._ctrl_dt
+        delta = torch.clamp(delta, min=-max_delta, max=max_delta)
+        tau_rl = tau_prev + delta
+        # First-order lag
+        tau_filt = tau_prev + self._act_alpha * (tau_rl - tau_prev)
+        # Friction
+        tau_fric = self._act_coulomb * torch.sign(qd) + self._act_viscous * qd
+        tau_eff = tau_filt - tau_fric
+        # Saturation
+        tau_sat = torch.clamp(tau_eff, min=-self._act_tau_max, max=self._act_tau_max)
+        # Update state
+        tau_prev[:] = tau_sat
+        return tau_sat
 
     # -----------------------------
     # Observations / Rewards / Dones helpers
