@@ -1,6 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
@@ -27,30 +25,20 @@ class FrankaDlEnv(DirectRLEnv):
     cfg: FrankaDlEnvCfg
 
     def __init__(self, cfg: FrankaDlEnvCfg, render_mode: str | None = None, **kwargs):
-        # <<<<<<<<<<<<<<<<<<<< MODIFICATION: DEBUGGING PRINT STATEMENT >>>>>>>>>>>>>>>>>>>>
-        # This will confirm that the script is being executed.
-        print("--- Initializing FrankaDlEnv ---")
-        # Call the parent class constructor to build the scene
+        print("--- Initializing FrankaDlEnv ---")  # <<< MODIFICATION: debug init
         super().__init__(cfg, render_mode, **kwargs)
 
-        # Store useful buffers after the scene is created
         self.robot_dof_targets = self._robot.data.default_joint_pos.clone()
         self.robot2_dof_targets = self._robot2.data.default_joint_pos.clone()
 
-        # Grasping state machine for horizontal pickup
-        self.grasp_phase = "approach"  # "approach", "descend", "grasp", "lift", "hold"
+        self.grasp_phase = "approach"
         self.phase_timer = 0
         self.rod_grasped = False
-        
-        # Target poses for end-effectors will be calculated dynamically based on rod position
         self.target_poses_calculated = False
 
-        # <<<<<<<<<<<<<<<<<<<< MODIFICATION: ADDING A VELOCITY FILTER >>>>>>>>>>>>>>>>>>>>
-        # This will limit how much the joint targets can change per step to prevent shaking.
-        # We are using a much smaller value now to aggressively clamp the trajectory.
-        self.max_joint_speed = 0.05  # Lowered from 0.5 to a much smaller value.
+        # <<< MODIFICATION: add smoothing >>>
+        self.max_joint_speed = 0.05  
 
-        # --- Differential IK Controllers ---
         diff_ik_cfg = DifferentialIKControllerCfg(
             command_type="pose",
             use_relative_mode=False,
@@ -59,31 +47,25 @@ class FrankaDlEnv(DirectRLEnv):
         self.diff_ik_controller_1 = DifferentialIKController(diff_ik_cfg, num_envs=self.num_envs, device=self.device)
         self.diff_ik_controller_2 = DifferentialIKController(diff_ik_cfg, num_envs=self.num_envs, device=self.device)
 
-        # --- Visualization Markers (optional but recommended) ---
         frame_marker_cfg = FRAME_MARKER_CFG.copy()
         frame_marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
         self.ee1_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/robot1_ee_goal"))
         self.ee2_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/robot2_ee_goal"))
         
-        # --- Robot Scene Entities (needed for Jacobian) ---
         self.robot1_entity_cfg = SceneEntityCfg("robot", joint_names=["panda_joint.*"], body_names=["panda_hand"])
         self.robot2_entity_cfg = SceneEntityCfg("robot2", joint_names=["panda_joint.*"], body_names=["panda_hand"])
         self.robot1_entity_cfg.resolve(self.scene)
         self.robot2_entity_cfg.resolve(self.scene)
 
-        # Calculate correct Jacobian indices
-        if self._robot.is_fixed_base:
-            self.ee1_jacobi_idx = self.robot1_entity_cfg.body_ids[0] - 1
-        else:
-            self.ee1_jacobi_idx = self.robot1_entity_cfg.body_ids[0]
-            
-        if self._robot2.is_fixed_base:
-            self.ee2_jacobi_idx = self.robot2_entity_cfg.body_ids[0] - 1
-        else:
-            self.ee2_jacobi_idx = self.robot2_entity_cfg.body_ids[0]
+        self.ee1_jacobi_idx = self.robot1_entity_cfg.body_ids[0] - 1 if self._robot.is_fixed_base else self.robot1_entity_cfg.body_ids[0]
+        self.ee2_jacobi_idx = self.robot2_entity_cfg.body_ids[0] - 1 if self._robot2.is_fixed_base else self.robot2_entity_cfg.body_ids[0]
+
+        # <<< MODIFICATION: storage for publishing >>>
+        self.rod_current_pose = None
+        self.rod_trajectory = {"robot1": [], "robot2": []}
+        self._print_every_n_steps = 1
 
     def _setup_scene(self):
-        """Spawns and initializes assets in the scene."""
         self._robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self._robot
         self._robot2 = Articulation(self.cfg.robot2)
@@ -91,108 +73,88 @@ class FrankaDlEnv(DirectRLEnv):
         self._rod = RigidObject(self.cfg.rod)
         self.scene.rigid_objects["rod"] = self._rod
 
-        # Set up terrain and clone environments
         self.cfg.terrain.num_envs = self.cfg.scene.num_envs
         self.cfg.terrain.env_spacing = self.cfg.scene.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
         self.scene.clone_environments(copy_from_source=False)
         
-        # Add a light
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+    # <<< MODIFICATION: helper format + publisher >>>
+    def _format_pose(self, pos_tensor: torch.Tensor, quat_tensor: torch.Tensor) -> dict:
+        pos = pos_tensor.cpu().tolist()
+        quat = quat_tensor.cpu().tolist()
+        return {"position": {"x": pos[0], "y": pos[1], "z": pos[2]}, "quaternion": quat}
+
+    def _publish_rod_and_trajectory(self, when: str = "calculated"):
+        rod_pos = self._rod.data.root_pos_w[0].cpu()
+        rod_quat = self._rod.data.root_quat_w[0].cpu()
+        self.rod_current_pose = self._format_pose(rod_pos, rod_quat)
+
+        def fmt_list(traj):
+            return [self._format_pose(p[:3], p[3:7]) for p in traj]
+
+        print(f"\n=== ROD & TRAJECTORY PUBLISH [{when.upper()}] ===")
+        print("Rod current pose:", self.rod_current_pose)
+        print("Robot1 trajectory:", fmt_list(self.rod_trajectory["robot1"]))
+        print("Robot2 trajectory:", fmt_list(self.rod_trajectory["robot2"]))
+        print("=== END ===\n")
+
     def calculate_target_poses_from_rod(self):
-        """
-        Dynamically calculate target Cartesian poses based on the actual rod position.
-        This ensures the arms approach the rod at its correct location.
-        """
         rod_pos = self._rod.data.root_pos_w[0]
         rod_quat = self._rod.data.root_quat_w[0]
-        
-        # <<<<<<<<<<<<<<<<<<<< MODIFICATION: NEW OFFSETS FOR THE PROVIDED CFG >>>>>>>>>>>>>>>>>>>>
-        # The offsets have been adjusted to account for the rod's position at (1.5, 0.0, 2.0).
-        # We need to ensure the arms move to the rod's x-coordinate (1.5) and approach it from the side.
-        
-        # The rotation for a horizontal grasp with grippers facing down.
         grasp_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device)
-        
-        # The right arm (Robot) needs to move towards the rod from its starting position at (1.0, 0.0, 0.0)
-        # We want it to be to the right of the rod's center, approaching from the negative y-axis.
-        right_arm_x = rod_pos[0] + 0.1 # Right side of the rod
-        approach_y_offset = -0.25 # To approach from the front
-        approach_height = rod_pos[2] + 0.15 # 15 cm above the rod's height
-        
-        # --- Robot 1 (Right Arm) Target Poses ---
-        self.robot1_approach_pose = torch.zeros(1, 7, device=self.device)
-        self.robot1_approach_pose[0, 0:3] = torch.tensor([right_arm_x, approach_y_offset, approach_height], device=self.device)
-        self.robot1_approach_pose[0, 3:7] = grasp_quat
 
-        self.robot1_descend_pose = self.robot1_approach_pose.clone()
-        self.robot1_descend_pose[0, 2] = rod_pos[2] + 0.05 # 5 cm above the rod for descent
+        # Robot1
+        right_arm_x = rod_pos[0] + 0.1
+        approach_y_offset = -0.25
+        approach_height = rod_pos[2] + 0.15
+        self.robot1_approach_pose = torch.tensor([[right_arm_x, approach_y_offset, approach_height, *grasp_quat]], device=self.device)
+        self.robot1_descend_pose = self.robot1_approach_pose.clone(); self.robot1_descend_pose[0, 2] = rod_pos[2] + 0.05
+        self.robot1_grasp_pose = self.robot1_descend_pose.clone(); self.robot1_grasp_pose[0, 1] = rod_pos[1] + 0.05
+        self.robot1_lift_pose = self.robot1_grasp_pose.clone(); self.robot1_lift_pose[0, 2] += 0.3
 
-        self.robot1_grasp_pose = self.robot1_descend_pose.clone()
-        self.robot1_grasp_pose[0, 1] = rod_pos[1] + 0.05 # Move into the rod to grasp
-
-        self.robot1_lift_pose = self.robot1_grasp_pose.clone()
-        self.robot1_lift_pose[0, 2] += 0.3
-
-        # The left arm (Robot2) needs to move from its starting position at (1.0, 1.0, 0.0)
-        # We want it to be to the left of the rod's center.
+        # Robot2
         left_arm_x = rod_pos[0] - 0.1
-        
-        # --- Robot 2 (Left Arm) Target Poses ---
-        self.robot2_approach_pose = torch.zeros(1, 7, device=self.device)
-        self.robot2_approach_pose[0, 0:3] = torch.tensor([left_arm_x, approach_y_offset, approach_height], device=self.device)
-        self.robot2_approach_pose[0, 3:7] = grasp_quat
+        self.robot2_approach_pose = torch.tensor([[left_arm_x, approach_y_offset, approach_height, *grasp_quat]], device=self.device)
+        self.robot2_descend_pose = self.robot2_approach_pose.clone(); self.robot2_descend_pose[0, 2] = rod_pos[2] + 0.05
+        self.robot2_grasp_pose = self.robot2_descend_pose.clone(); self.robot2_grasp_pose[0, 1] = rod_pos[1] + 0.05
+        self.robot2_lift_pose = self.robot2_grasp_pose.clone(); self.robot2_lift_pose[0, 2] += 0.3
 
-        self.robot2_descend_pose = self.robot2_approach_pose.clone()
-        self.robot2_descend_pose[0, 2] = rod_pos[2] + 0.05
+        # store
+        self.rod_trajectory["robot1"] = [p.squeeze(0).cpu() for p in [
+            self.robot1_approach_pose, self.robot1_descend_pose, self.robot1_grasp_pose, self.robot1_lift_pose
+        ]]
+        self.rod_trajectory["robot2"] = [p.squeeze(0).cpu() for p in [
+            self.robot2_approach_pose, self.robot2_descend_pose, self.robot2_grasp_pose, self.robot2_lift_pose
+        ]]
 
-        self.robot2_grasp_pose = self.robot2_descend_pose.clone()
-        self.robot2_grasp_pose[0, 1] = rod_pos[1] + 0.05
-
-        self.robot2_lift_pose = self.robot2_grasp_pose.clone()
-        self.robot2_lift_pose[0, 2] += 0.3
-        
         self.target_poses_calculated = True
-        print("Calculated target poses based on rod position.")
-        print(f"Robot 1 Approach Pose: {self.robot1_approach_pose}")
-        print(f"Robot 2 Approach Pose: {self.robot2_approach_pose}")
-
+        self._publish_rod_and_trajectory("calculated")
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        """Handle the physics step logic."""
-        try:
-            if not self.target_poses_calculated:
-                self.calculate_target_poses_from_rod()
-            
-            # Use the state machine to control the grasping process
-            self._execute_grasp_sequence()
+        if not self.target_poses_calculated:
+            self.calculate_target_poses_from_rod()
+        self._execute_grasp_sequence()
+        self._apply_action()
+        self.phase_timer += 1
 
-            # <<<<<<<<<<<<<<<<<<<< NEW CODE: Placeholder for direct commands >>>>>>>>>>>>>>>>>>>>
-            # This is where you can call the new function to give direct commands to the arms.
-            # You can replace the "None" values with the joint targets you want to command.
-            # joint_targets_robot1 = torch.tensor([[0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.04, 0.04]], device=self.device)
-            # joint_targets_robot2 = torch.tensor([[0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.04, 0.04]], device=self.device)
-            # self.set_arm_joint_targets(1, joint_targets_robot1)
-            # self.set_arm_joint_targets(2, joint_targets_robot2)
+        # <<< MODIFICATION: print per-step rod pose + phase >>>
+        if (self.phase_timer % self._print_every_n_steps) == 0:
+            rod_pos = self._rod.data.root_pos_w[0]
+            rod_quat = self._rod.data.root_quat_w[0]
+            rp = self._format_pose(rod_pos, rod_quat)
+            print(f"[Step {self.phase_timer}] Phase: {self.grasp_phase} | Rod pos: {rp['position']} | Grasped: {self.rod_grasped}")
 
-            self._apply_action()
-            self.phase_timer += 1
-            
-            # Print at every step for immediate feedback
-            print("--- Current Trajectory Step ---")
-            print(f"Step: {self.phase_timer}, Phase: {self.grasp_phase}")
-            print(f"Left Arm Targets: {self.robot_dof_targets.tolist()}")
-            # print(f"end effector: {self.robot()}")
-            print(f"Right Arm Targets: {self.robot2_dof_targets.tolist()}")
-            print("------------------------------")
+        if self.target_poses_calculated and self.phase_timer == 1:
+            self._publish_rod_and_trajectory("runtime-first-step")
 
-            # Visualization
-            self._visualize_goals()
-        except Exception as e:
-            print(f"An error occurred in _pre_physics_step: {e}")
-            raise
+        self._visualize_goals()
+        
+        # except Exception as e:
+        #     print(f"An error occurred in _pre_physics_step: {e}")
+        #     raise
 
     def _execute_grasp_sequence(self):
         """Executes the refined state machine for horizontal pickup."""

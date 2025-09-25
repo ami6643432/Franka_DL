@@ -44,6 +44,7 @@ parser.add_argument(
     choices=["AMP", "PPO", "IPPO", "MAPPO"],
     help="The RL algorithm used for training the skrl agent.",
 )
+parser.add_argument("--wandb", action="store_true", default=False, help="Enable Weights & Biases logging (sync TensorBoard)")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -156,6 +157,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
+    # optional: enable W&B and sync TensorBoard logs
+    if args_cli.wandb:
+        try:
+            import wandb
+
+            wandb.init(
+                project="franka_cabinet",
+                name=log_dir.split(os.sep)[-1],
+                dir=log_root_path,
+                config={"algorithm": algorithm, "num_envs": env_cfg.scene.num_envs, "seed": agent_cfg.get("seed", None)},
+                sync_tensorboard=True,
+                reinit=True,
+            )
+        except Exception as e:
+            print(f"[WARN] wandb not enabled: {e}")
+
     # get checkpoint path (to resume training)
     resume_path = retrieve_file_path(args_cli.checkpoint) if args_cli.checkpoint else None
 
@@ -192,6 +209,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # run training
     runner.run()
+
+    # close wandb session if opened
+    if args_cli.wandb:
+        try:
+            import wandb
+
+            wandb.finish()
+        except Exception:
+            pass
 
     # close the simulator
     env.close()

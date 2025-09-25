@@ -26,6 +26,8 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.math import sample_uniform
 
+from .controllers.custom_operational_space_cfg import CustomOperationalSpaceControllerCfg
+
 
 @configclass
 class FrankaCabinetEnvCfg(DirectMARLEnvCfg):
@@ -119,21 +121,21 @@ class FrankaCabinetEnvCfg(DirectMARLEnvCfg):
                 joint_names_expr=["panda_joint[1-4]"],
                 effort_limit_sim=87.0,
                 velocity_limit_sim=2.175,
-                stiffness=80.0,
-                damping=4.0,
+                stiffness=0.0,
+                damping=5.0,
             ),
             "panda_forearm": ImplicitActuatorCfg(
                 joint_names_expr=["panda_joint[5-7]"],
                 effort_limit_sim=12.0,
                 velocity_limit_sim=2.61,
-                stiffness=80.0,
-                damping=4.0,
+                stiffness=0.0,
+                damping=5.0,
             ),
             "panda_hand": ImplicitActuatorCfg(
                 joint_names_expr=["panda_finger_joint.*"],
                 effort_limit_sim=200.0,
                 velocity_limit_sim=0.2,
-                stiffness=2e3,
+                stiffness=0,
                 damping=1e2,
             ),
         },
@@ -217,6 +219,22 @@ class FrankaCabinetEnvCfg(DirectMARLEnvCfg):
     straddle_threshold: float = 0.01         # meters; fingers must be this far on opposite sides
     straddle_reward_scale: float = 0.5       # reward weight for straddling bonus
 
+    # torque controller parameters
+    controller_torque_limit: float = 50.0    # absolute torque clamp for arm joints
+    use_torque_controller: bool = True       # toggle torque-based control for arm joints
+
+    # controller configuration (default joint-space PD)
+    controller_cfg: CustomOperationalSpaceControllerCfg = CustomOperationalSpaceControllerCfg(
+        control_mode="joint_pd",
+        pd_kp= [200.0, 200.0, 200.0, 200.0, 100.0, 100.0, 100.0],
+        pd_kd= [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+        joint_inertial_compensation=False,
+        joint_gravity_compensation=False,
+        target_types=("pose_abs",),
+        enable_debug_logging=False,
+        debug_log_interval=240,
+    )
+
 
 class FrankaCabinetEnv(DirectMARLEnv):
     """Franka cabinet manipulation task with configurable multi-agent control."""
@@ -262,11 +280,14 @@ class FrankaCabinetEnv(DirectMARLEnv):
         finger_idx1 = self._robot.find_joints("panda_finger_joint1")[0]
         finger_idx2 = self._robot.find_joints("panda_finger_joint2")[0]
         self.finger_joint_ids = torch.tensor([finger_idx1, finger_idx2], device=self.device, dtype=torch.long)
+        arm_indices = self._robot.find_joints("panda_joint[1-7]")[0]
+        self.arm_joint_ids = torch.tensor(arm_indices, device=self.device, dtype=torch.long)
         self.robot_dof_speed_scales[self.finger_joint_ids[0]] = self.cfg.finger_speed_scale
         self.robot_dof_speed_scales[self.finger_joint_ids[1]] = self.cfg.finger_speed_scale
 
         self.robot_dof_targets = torch.zeros((self.num_envs, self._robot.num_joints), device=self.device)
         self.robot_dof_targets[:] = self._robot.data.default_joint_pos.clone().to(device=self.device)
+        self._arm_pos_target = self.robot_dof_targets[:, self.arm_joint_ids].clone()
 
         # Agent metadata for multi-agent control mappings.
         self._agent_names = tuple(self.cfg.possible_agents)
@@ -380,6 +401,15 @@ class FrankaCabinetEnv(DirectMARLEnv):
         # debug step counter
         self._debug_step = 0
 
+        # initialize operational-space controller (used later for torque tracking)
+        self.use_torque_controller = getattr(self.cfg, "use_torque_controller", True)
+        if self.use_torque_controller:
+            self.controller_cfg = self.cfg.controller_cfg
+            self.controller = self.controller_cfg.class_type(self.controller_cfg, self.num_envs, self.device)
+        else:
+            self.controller_cfg = None
+            self.controller = None
+
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self._cabinet = Articulation(self.cfg.cabinet)
@@ -425,9 +455,37 @@ class FrankaCabinetEnv(DirectMARLEnv):
 
         targets = self.robot_dof_targets + self.robot_dof_speed_scales * self.dt * self.actions * self.cfg.action_scale
         self.robot_dof_targets[:] = torch.clamp(targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
+        if self.use_torque_controller:
+            # cache desired arm joint positions for controller
+            self._arm_pos_target = self.robot_dof_targets[:, self.arm_joint_ids].clone()
 
     def _apply_action(self):
-        self._robot.set_joint_position_target(self.robot_dof_targets)
+        if self.use_torque_controller and self.controller is not None:
+            if not hasattr(self, "_arm_pos_target"):
+                self._arm_pos_target = self.robot_dof_targets[:, self.arm_joint_ids].clone()
+
+            current_arm_pos = self._robot.data.joint_pos[:, self.arm_joint_ids]
+            current_arm_vel = self._robot.data.joint_vel[:, self.arm_joint_ids]
+            self.controller.set_joint_command(joint_positions=self._arm_pos_target, joint_velocities=None)
+            arm_torques = self.controller.compute_joint_pd(
+                current_joint_pos=current_arm_pos,
+                current_joint_vel=current_arm_vel,
+                mass_matrix=None,
+                gravity=None,
+            )
+            torque_limit = self.cfg.controller_torque_limit
+            arm_torques = torch.clamp(arm_torques, -torque_limit, torque_limit)
+            self._robot.set_joint_effort_target(arm_torques, joint_ids=self.arm_joint_ids)
+        else:
+            arm_targets = self.robot_dof_targets[:, self.arm_joint_ids]
+            self._robot.set_joint_position_target(arm_targets, joint_ids=self.arm_joint_ids)
+
+        # fingers remain position controlled
+        finger_targets = self.robot_dof_targets[:, self.finger_joint_ids]
+        self._robot.set_joint_position_target(finger_targets, joint_ids=self.finger_joint_ids)
+        if self.use_torque_controller and self.controller is not None:
+            zero_finger_effort = torch.zeros_like(finger_targets)
+            self._robot.set_joint_effort_target(zero_finger_effort, joint_ids=self.finger_joint_ids)
 
     # post-physics step calls
 
@@ -490,6 +548,10 @@ class FrankaCabinetEnv(DirectMARLEnv):
 
         # Need to refresh the intermediate values so that _get_observations() can use the latest values
         self._compute_intermediate_values(env_ids)
+
+        # reset controller internal state
+        if self.use_torque_controller and self.controller is not None:
+            self.controller.reset()
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
         prev_state = self._shared_state_curr.clone() if self._shared_state_curr is not None else None

@@ -56,8 +56,16 @@ def main():
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
-            # sample actions from -1 to 1
-            actions = 2 * torch.rand(env.action_space.shape, device=env.unwrapped.device) - 1
+            device = env.unwrapped.device
+
+            if isinstance(env.action_space, gym.spaces.Dict):
+                actions = {
+                    agent: 2 * torch.rand(space.shape, device=device) - 1
+                    for agent, space in env.action_space.spaces.items()
+                }
+            else:
+                actions = 2 * torch.rand(env.action_space.shape, device=device) - 1
+
             # apply actions
             env.step(actions)
 
